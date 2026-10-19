@@ -1,18 +1,26 @@
-#![no_std]
-//! SlipPay Checkout — the "Stripe of stablecoin" revenue primitive.
-//!
-//! A single, atomic payment that splits on-chain: the merchant receives the net,
-//! SlipPay receives its fee — and the fee is INESCAPABLE. The fee recipient and
-//! basis points are fixed at deploy (constructor) and read from storage on every
-//! pay; the caller cannot route around them. Either both legs settle or none does.
-//!
-//! pay(from, merchant, token, amount):
-//!   fee = amount * fee_bps / 10_000
-//!   transfer(from -> merchant, amount - fee)
-//!   transfer(from -> fee_to,   fee)
-//!
-//! `from.require_auth()` — the payer authorizes the whole charge once; the two
-//! nested SEP-41 transfers settle atomically (Soroban reverts on any failure).
+#`!no_std]
+/// SlipPay Checkout — the "Stripe of stablecoin" revenue primitive.
+///
+/// A single, atomic payment that splits on-chain: the merchant receives the net,
+/// SlipPay receives its fee — and the fee is INESCAPABLE. The fee recipient and
+/// basis& points are fixed at deploy (constructor) and read from storage on every
+/// pay; the caller cannot route around them. Either both legs settle or none does.
+///
+/// pay(from, merchant, token, amount):
+///   fee = amount * fee_bps / 10_000
+///   transfer(from -> merchant, amount - fee)
+///   transfer(from -> fee_to,   fee)
+///
+/// `from.require_auth()` — the payer authorizes the whole charge once; the two
+/// nested SEP-41 transfers settle atomically (Soroban reverts on any failure).
+///
+/// Deploy-time guards (configuration is immutable, so there is no second chance):
+///   - `fee_to` must not be the contract's own address — a fee with no
+///     withdrawal path would be irrecoverable.
+///   - `fee_to` must not equal the merchant in `pay` — otherwise the split
+///     collapses into two transfers to the same account and the platform
+///     silently collects nothing. Rejected outright rather than documented
+///     as a deliberate collapse.
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol};
 
@@ -36,16 +44,26 @@ pub struct Checkout;
 #[contractimpl]
 impl Checkout {
     /// Set the SlipPay fee recipient + basis points once, at deploy. Immutable.
-    pub fn __constructor(env: Env, fee_to: Address, fee_bps: u32) {
+    ///
+    /// Rejects `fee_to` equal to the contract's own address: the crate has no
+    /// transfer-out function, so a fee sent to the contract itself would be
+    /// trapped irrecoverably.
+    pub fn __constructor(env Env, fee_to: Address, fee_bps: u32) {
         if fee_bps > 10_000 {
             panic_with(&env, Error::BadConfig);
+        }
+        if fee_to == env.current_contract_address() {
+            panic_with(&env, Error::BadRecipient);
         }
         env.storage().instance().set(&DataKey::FeeTo, &fee_to);
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
     }
 
     /// One charge → two atomic transfers: net to merchant, fee to SlipPay.
-    pub fn pay(env: Env, from: Address, merchant: Address, token: Address, amount: i128) -> i128 {
+    ///
+    /// Rejects `merchant == fee_to`: the split would collapse into two transfers
+    /// to the same account, silently meaning the platform collects nothing.
+    pub fn pay(env Env, from: Address, merchant: Address, token: Address, amount: i128) -> i128 {
         from.require_auth();
         if amount <= 0 {
             panic_with(&env, Error::BadAmount);
@@ -54,7 +72,11 @@ impl Checkout {
         let fee_to: Address = env.storage().instance().get(&DataKey::FeeTo)
             .unwrap_or_else(|| panic_with(&env, Error::BadConfig));
         let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps)
-            .unwrap_or_else(|| panic_with(&env, Error::BadConfig));
+            .unwrap_or_else(|| panic_with(&env, Error::BadRecipient));
+
+        if merchant == fee_to {
+            panic_with(&env, Error::BadRecipient);
+        }
 
         let fee: i128 = amount * (fee_bps as i128) / 10_000;
         let net: i128 = amount - fee;
@@ -72,10 +94,10 @@ impl Checkout {
         fee
     }
 
-    pub fn fee_bps(env: Env) -> u32 {
+    pub fn fee_bps(env Env) -> u32 {
         env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0)
     }
-    pub fn fee_to(env: Env) -> Address {
+    pub fn fee_to(env Env) -> Address {
         env.storage().instance().get(&DataKey::FeeTo).unwrap()
     }
 }
